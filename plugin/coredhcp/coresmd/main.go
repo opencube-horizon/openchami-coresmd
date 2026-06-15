@@ -35,6 +35,7 @@ type Config struct {
 	// Parsed from configuration file
 	svcBaseURI    *url.URL              // svc_base_uri
 	ipxeBaseURI   *url.URL              // ipxe_base_uri
+	httpBootURI   string                // http_boot_uri (supports {arch} placeholder)
 	caCert        string                // ca_cert
 	cacheValid    *time.Duration        // cache_valid
 	leaseTime     *time.Duration        // lease_time
@@ -48,9 +49,10 @@ type Config struct {
 }
 
 func (c Config) String() string {
-	cfgStr := fmt.Sprintf("svc_base_uri=%s ipxe_base_uri=%s ca_cert=%s cache_valid=%s lease_time=%s single_port=%v tftp_dir=%s tftp_port=%d domain=%s rule_log=%s",
+	cfgStr := fmt.Sprintf("svc_base_uri=%s ipxe_base_uri=%s http_boot_uri=%s ca_cert=%s cache_valid=%s lease_time=%s single_port=%v tftp_dir=%s tftp_port=%d domain=%s rule_log=%s",
 		c.svcBaseURI,
 		c.ipxeBaseURI,
+		c.httpBootURI,
 		c.caCert,
 		c.cacheValid,
 		c.leaseTime,
@@ -343,6 +345,8 @@ func parseConfig(argv ...string) (cfg Config, errs []error) {
 				continue
 			}
 			cfg.rules = append(cfg.rules, rule)
+		case "http_boot_uri":
+			cfg.httpBootURI = strings.Trim(opt[1], `"'`)
 		default:
 			errs = append(errs, fmt.Errorf("non-comment arg %d: unknown config key '%s' (skipping)", idx, opt[0]))
 			continue
@@ -497,14 +501,32 @@ func Handler4(req, resp *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, bool) {
 	}).Info("DHCPv4 assignment")
 
 	// STEP 2: Send boot config
-	if cinfo := req.Options.Get(dhcpv4.OptionUserClassInformation); string(cinfo) != "iPXE" {
-		// BOOT STAGE 1: Send iPXE bootloader over TFTP
-		resp, _ = ipxe.ServeIPXEBootloader(log, req, resp)
+	//
+	// Client detection (from DHCP options):
+	//   Option 60 prefix "HTTPClient" or Option 93 ∈ HTTP arch types → UEFI HTTP Boot
+	//   Option 77 (User Class) == "iPXE" → iPXE post-bootstrap, wants boot script
+	//   Otherwise → PXE stage 1, serve iPXE bootloader via TFTP
+	//
+	// BootTransport (per-node policy from SMD): "http", "tftp", "" (empty = no restriction)
+	comp := smdCache.Components[ifaceInfo.CompID]
+	transport := comp.BootTransport
+
+	if ipxe.IsHTTPBootClient(req) {
+		if (transport == "http" || transport == "") && globalConfig.httpBootURI != "" {
+			resp, _ = ipxe.ServeHTTPBoot(log, req, resp, globalConfig.httpBootURI)
+		} else {
+			return resp, false
+		}
+	} else if transport == "tftp" || transport == "" {
+		if cinfo := req.Options.Get(dhcpv4.OptionUserClassInformation); string(cinfo) == "iPXE" {
+			bssURL := globalConfig.ipxeBaseURI.JoinPath("/boot/v1/bootscript")
+			bssURL.RawQuery = fmt.Sprintf("mac=%s", hwAddr)
+			resp.Options.Update(dhcpv4.OptBootFileName(bssURL.String()))
+		} else {
+			resp, _ = ipxe.ServeIPXEBootloader(log, req, resp)
+		}
 	} else {
-		// BOOT STAGE 2: Send URL to BSS boot script
-		bssURL := globalConfig.ipxeBaseURI.JoinPath("/boot/v1/bootscript")
-		bssURL.RawQuery = fmt.Sprintf("mac=%s", hwAddr)
-		resp.Options.Update(dhcpv4.OptBootFileName(bssURL.String()))
+		return resp, false
 	}
 
 	debug.DebugResponse(log, resp)

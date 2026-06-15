@@ -40,9 +40,10 @@ type IPAddress struct {
 }
 
 type Component struct {
-	ID   string `json:"ID"`
-	NID  int64  `json:"NID"`
-	Type string `json:"Type"`
+	ID            string `json:"ID"`
+	NID           int64  `json:"NID"`
+	Type          string `json:"Type"`
+	BootTransport string `json:"BootTransport,omitempty"`
 }
 
 func NewSmdClient(baseURL *url.URL) *SmdClient {
