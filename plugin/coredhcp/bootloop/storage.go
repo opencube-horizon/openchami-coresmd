@@ -6,20 +6,32 @@
 package bootloop
 
 import (
-	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 
-	_ "github.com/mattn/go-sqlite3"
+	bolt "go.etcd.io/bbolt"
 )
 
-func loadDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s", path))
+var bucketLeases4 = []byte("leases4")
+
+type leaseRecord struct {
+	IP       string `json:"IP"`
+	Expiry   int    `json:"Expiry"`
+	Hostname string `json:"Hostname"`
+}
+
+func loadDB(path string) (*bolt.DB, error) {
+	db, err := bolt.Open(path, 0600, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database (%T): %w", err, err)
 	}
-	if _, err := db.Exec("create table if not exists leases4 (mac string not null, ip string not null, expiry int, hostname string not null, primary key (mac, ip))"); err != nil {
+	if err := db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(bucketLeases4)
+		return err
+	}); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("table creation failed: %w", err)
 	}
 	return db, nil
@@ -28,45 +40,46 @@ func loadDB(path string) (*sql.DB, error) {
 // loadRecords loads the DHCPv6/v4 Records global map with records stored on
 // the specified file. The records have to be one per line, a mac address and an
 // IP address.
-func loadRecords(db *sql.DB) (map[string]*Record, error) {
-	rows, err := db.Query("select mac, ip, expiry, hostname from leases4")
+func loadRecords(db *bolt.DB) (map[string]*Record, error) {
+	records := make(map[string]*Record)
+	err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketLeases4)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			mac := string(k)
+			hwaddr, err := net.ParseMAC(mac)
+			if err != nil {
+				return fmt.Errorf("malformed hardware address: %s", mac)
+			}
+			var lr leaseRecord
+			if err := json.Unmarshal(v, &lr); err != nil {
+				return fmt.Errorf("failed to scan row: %w", err)
+			}
+			ipaddr := net.ParseIP(lr.IP)
+			if ipaddr.To4() == nil {
+				return fmt.Errorf("expected an IPv4 address, got: %v", ipaddr)
+			}
+			records[hwaddr.String()] = &Record{IP: ipaddr, expires: lr.Expiry, hostname: lr.Hostname}
+			return nil
+		})
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query leases database: %w", err)
-	}
-	defer rows.Close()
-	var (
-		mac, ip, hostname string
-		expiry            int
-		records           = make(map[string]*Record)
-	)
-	for rows.Next() {
-		if err := rows.Scan(&mac, &ip, &expiry, &hostname); err != nil {
-			return nil, fmt.Errorf("failed to scan row: %w", err)
-		}
-		hwaddr, err := net.ParseMAC(mac)
-		if err != nil {
-			return nil, fmt.Errorf("malformed hardware address: %s", mac)
-		}
-		ipaddr := net.ParseIP(ip)
-		if ipaddr.To4() == nil {
-			return nil, fmt.Errorf("expected an IPv4 address, got: %v", ipaddr)
-		}
-		records[hwaddr.String()] = &Record{IP: ipaddr, expires: expiry, hostname: hostname}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed lease database row scanning: %w", err)
 	}
 	return records, nil
 }
 
 // deleteIPAddress deletes a lease from storage
 func (p *PluginState) deleteIPAddress(mac net.HardwareAddr) error {
-	stmt, err := p.leasedb.Prepare(`delete from leases4 where mac=?`)
-	if err != nil {
-		return fmt.Errorf("statement preparation failed: %w", err)
-	}
-	defer stmt.Close()
-	if _, err := stmt.Exec(mac.String()); err != nil {
+	if err := p.leasedb.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketLeases4)
+		if b == nil {
+			return nil
+		}
+		return b.Delete([]byte(mac.String()))
+	}); err != nil {
 		return fmt.Errorf("record delete failed: %w", err)
 	}
 	return nil
@@ -74,17 +87,21 @@ func (p *PluginState) deleteIPAddress(mac net.HardwareAddr) error {
 
 // saveIPAddress writes out a lease to storage
 func (p *PluginState) saveIPAddress(mac net.HardwareAddr, record *Record) error {
-	stmt, err := p.leasedb.Prepare(`insert or replace into leases4(mac, ip, expiry, hostname) values (?, ?, ?, ?)`)
+	data, err := json.Marshal(leaseRecord{
+		IP:       record.IP.String(),
+		Expiry:   record.expires,
+		Hostname: record.hostname,
+	})
 	if err != nil {
-		return fmt.Errorf("statement preparation failed: %w", err)
+		return fmt.Errorf("record insert/update failed: %w", err)
 	}
-	defer stmt.Close()
-	if _, err := stmt.Exec(
-		mac.String(),
-		record.IP.String(),
-		record.expires,
-		record.hostname,
-	); err != nil {
+	if err := p.leasedb.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketLeases4)
+		if b == nil {
+			return fmt.Errorf("leases4 bucket not found")
+		}
+		return b.Put([]byte(mac.String()), data)
+	}); err != nil {
 		return fmt.Errorf("record insert/update failed: %w", err)
 	}
 	return nil

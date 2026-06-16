@@ -6,15 +6,17 @@
 package bootloop
 
 import (
-	"database/sql"
+	"encoding/json"
+	"fmt"
 	"net"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	bolt "go.etcd.io/bbolt"
 )
 
-// helper to open a fresh test DB with the leases4 table created
-func openTestDB(t *testing.T) *sql.DB {
+func openTestDB(t *testing.T) *bolt.DB {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "leases.db")
@@ -25,15 +27,11 @@ func openTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
-//
-// Tests for loadDB
-//
-
 func TestLoadDB(t *testing.T) {
 	tests := []struct {
 		name string
 	}{{
-		name: "creates_leases4_table",
+		name: "creates_leases4_bucket",
 	}, {
 		name: "idempotent_on_existing_db",
 	}}
@@ -43,23 +41,22 @@ func TestLoadDB(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "leases.db")
 
-			// first call
 			db1, err := loadDB(path)
 			if err != nil {
 				t.Fatalf("first loadDB(%q) error = %v", path, err)
 			}
-			defer db1.Close()
 
-			// verify leases4 table exists
-			var name string
-			if err := db1.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='leases4'`).Scan(&name); err != nil {
-				t.Fatalf("leases4 table not found after loadDB: %v", err)
-			}
-			if name != "leases4" {
-				t.Fatalf("expected table name 'leases4', got %q", name)
+			if err := db1.View(func(tx *bolt.Tx) error {
+				if tx.Bucket([]byte("leases4")) == nil {
+					t.Fatalf("leases4 bucket not found after loadDB")
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("bucket check failed: %v", err)
 			}
 
-			// second call should also succeed (idempotent)
+			db1.Close()
+
 			db2, err := loadDB(path)
 			if err != nil {
 				t.Fatalf("second loadDB(%q) error = %v", path, err)
@@ -69,14 +66,10 @@ func TestLoadDB(t *testing.T) {
 	}
 }
 
-//
-// Tests for loadRecords
-//
-
 func TestLoadRecords(t *testing.T) {
 	tests := []struct {
 		name       string
-		setup      func(t *testing.T, db *sql.DB)
+		setup      func(t *testing.T, db *bolt.DB)
 		wantErrSub string
 		wantLen    int
 		wantKey    string
@@ -84,22 +77,25 @@ func TestLoadRecords(t *testing.T) {
 	}{
 		{
 			name: "empty_table_returns_empty_map",
-			setup: func(t *testing.T, db *sql.DB) {
-				// nothing to insert
+			setup: func(t *testing.T, db *bolt.DB) {
 			},
 			wantLen: 0,
 		},
 		{
 			name: "single_valid_row_loaded",
-			setup: func(t *testing.T, db *sql.DB) {
+			setup: func(t *testing.T, db *bolt.DB) {
 				const macStr = "aa:bb:cc:dd:ee:ff"
-				_, err := db.Exec(
-					`insert into leases4(mac, ip, expiry, hostname) values (?, ?, ?, ?)`,
-					macStr,
-					"192.168.1.10",
-					123,
-					"test-host",
-				)
+				err := db.Update(func(tx *bolt.Tx) error {
+					b := tx.Bucket([]byte("leases4"))
+					if b == nil {
+						return fmt.Errorf("bucket not found")
+					}
+					data, err := json.Marshal(leaseRecord{IP: "192.168.1.10", Expiry: 123, Hostname: "test-host"})
+					if err != nil {
+						return err
+					}
+					return b.Put([]byte(macStr), data)
+				})
 				if err != nil {
 					t.Fatalf("insert test lease: %v", err)
 				}
@@ -114,14 +110,18 @@ func TestLoadRecords(t *testing.T) {
 		},
 		{
 			name: "invalid_mac_gives_error",
-			setup: func(t *testing.T, db *sql.DB) {
-				_, err := db.Exec(
-					`insert into leases4(mac, ip, expiry, hostname) values (?, ?, ?, ?)`,
-					"zz:zz:zz:zz:zz:zz",
-					"192.168.1.10",
-					123,
-					"bad-mac-host",
-				)
+			setup: func(t *testing.T, db *bolt.DB) {
+				err := db.Update(func(tx *bolt.Tx) error {
+					b := tx.Bucket([]byte("leases4"))
+					if b == nil {
+						return fmt.Errorf("bucket not found")
+					}
+					data, err := json.Marshal(leaseRecord{IP: "192.168.1.10", Expiry: 123, Hostname: "bad-mac-host"})
+					if err != nil {
+						return err
+					}
+					return b.Put([]byte("zz:zz:zz:zz:zz:zz"), data)
+				})
 				if err != nil {
 					t.Fatalf("insert invalid mac lease: %v", err)
 				}
@@ -131,14 +131,18 @@ func TestLoadRecords(t *testing.T) {
 		},
 		{
 			name: "non_ipv4_address_gives_error",
-			setup: func(t *testing.T, db *sql.DB) {
-				_, err := db.Exec(
-					`insert into leases4(mac, ip, expiry, hostname) values (?, ?, ?, ?)`,
-					"aa:bb:cc:dd:ee:ff",
-					"2001:db8::1",
-					456,
-					"ipv6-host",
-				)
+			setup: func(t *testing.T, db *bolt.DB) {
+				err := db.Update(func(tx *bolt.Tx) error {
+					b := tx.Bucket([]byte("leases4"))
+					if b == nil {
+						return fmt.Errorf("bucket not found")
+					}
+					data, err := json.Marshal(leaseRecord{IP: "2001:db8::1", Expiry: 456, Hostname: "ipv6-host"})
+					if err != nil {
+						return err
+					}
+					return b.Put([]byte("aa:bb:cc:dd:ee:ff"), data)
+				})
 				if err != nil {
 					t.Fatalf("insert ipv6 lease: %v", err)
 				}
@@ -197,16 +201,13 @@ func TestLoadRecords(t *testing.T) {
 	}
 }
 
-//
-// Tests for (*PluginState).deleteIPAddress
-//
-
 func TestDeleteIPAddress(t *testing.T) {
 	tests := []struct {
-		name          string
-		setup         func(t *testing.T) (*PluginState, net.HardwareAddr)
-		wantErrSub    string
-		wantRemaining int // -1 means "don't check"
+		name           string
+		setup          func(t *testing.T) (*PluginState, net.HardwareAddr)
+		wantErrSub     string
+		wantKeyExists  bool
+		checkRemaining bool
 	}{
 		{
 			name: "delete_existing_lease",
@@ -216,19 +217,21 @@ func TestDeleteIPAddress(t *testing.T) {
 				if err != nil {
 					t.Fatalf("ParseMAC: %v", err)
 				}
-				_, err = db.Exec(
-					`insert into leases4(mac, ip, expiry, hostname) values (?, ?, ?, ?)`,
-					mac.String(),
-					"192.168.1.20",
-					111,
-					"delete-me",
-				)
+				err = db.Update(func(tx *bolt.Tx) error {
+					b := tx.Bucket([]byte("leases4"))
+					if b == nil {
+						return fmt.Errorf("bucket not found")
+					}
+					data, _ := json.Marshal(leaseRecord{IP: "192.168.1.20", Expiry: 111, Hostname: "delete-me"})
+					return b.Put([]byte(mac.String()), data)
+				})
 				if err != nil {
 					t.Fatalf("insert lease: %v", err)
 				}
 				return &PluginState{leasedb: db}, mac
 			},
-			wantRemaining: 0,
+			wantKeyExists:  false,
+			checkRemaining: true,
 		},
 		{
 			name: "delete_nonexistent_lease_no_error",
@@ -240,10 +243,11 @@ func TestDeleteIPAddress(t *testing.T) {
 				}
 				return &PluginState{leasedb: db}, mac
 			},
-			wantRemaining: 0,
+			wantKeyExists:  false,
+			checkRemaining: true,
 		},
 		{
-			name: "closed_db_causes_statement_preparation_error",
+			name: "closed_db_causes_error",
 			setup: func(t *testing.T) (*PluginState, net.HardwareAddr) {
 				db := openTestDB(t)
 				db.Close()
@@ -253,8 +257,8 @@ func TestDeleteIPAddress(t *testing.T) {
 				}
 				return &PluginState{leasedb: db}, mac
 			},
-			wantErrSub:    "statement preparation failed",
-			wantRemaining: -1,
+			wantErrSub:     "record delete failed",
+			checkRemaining: false,
 		},
 	}
 
@@ -284,25 +288,24 @@ func TestDeleteIPAddress(t *testing.T) {
 				t.Fatalf("deleteIPAddress() unexpected error = %v", err)
 			}
 
-			if tt.wantRemaining >= 0 {
-				var count int
-				if err := p.leasedb.QueryRow(
-					`select count(*) from leases4 where mac=?`,
-					mac.String(),
-				).Scan(&count); err != nil {
-					t.Fatalf("count query failed: %v", err)
+			if tt.checkRemaining {
+				var keyExists bool
+				if viewErr := p.leasedb.View(func(tx *bolt.Tx) error {
+					b := tx.Bucket([]byte("leases4"))
+					if b != nil && b.Get([]byte(mac.String())) != nil {
+						keyExists = true
+					}
+					return nil
+				}); viewErr != nil {
+					t.Fatalf("key existence check failed: %v", viewErr)
 				}
-				if count != tt.wantRemaining {
-					t.Fatalf("rows with mac %s = %d, want %d", mac.String(), count, tt.wantRemaining)
+				if keyExists != tt.wantKeyExists {
+					t.Fatalf("key %s exists = %v, want %v", mac.String(), keyExists, tt.wantKeyExists)
 				}
 			}
 		})
 	}
 }
-
-//
-// Tests for (*PluginState).saveIPAddress
-//
 
 func TestSaveIPAddress(t *testing.T) {
 	tests := []struct {
@@ -326,7 +329,7 @@ func TestSaveIPAddress(t *testing.T) {
 			},
 		},
 		{
-			name: "closed_db_causes_statement_preparation_error",
+			name: "closed_db_causes_error",
 			setup: func(t *testing.T) *PluginState {
 				db := openTestDB(t)
 				db.Close()
@@ -338,7 +341,7 @@ func TestSaveIPAddress(t *testing.T) {
 				expires:  333,
 				hostname: "closed-db-host",
 			},
-			wantErrSub: "statement preparation failed",
+			wantErrSub: "record insert/update failed",
 		},
 	}
 
@@ -373,37 +376,37 @@ func TestSaveIPAddress(t *testing.T) {
 				t.Fatalf("saveIPAddress() unexpected error = %v", err)
 			}
 
-			// Verify row in DB
-			var ip string
-			var expiry int
-			var hostname string
-			if err := p.leasedb.QueryRow(
-				`select ip, expiry, hostname from leases4 where mac=?`,
-				mac.String(),
-			).Scan(&ip, &expiry, &hostname); err != nil {
-				t.Fatalf("select lease failed: %v", err)
+			var stored leaseRecord
+			if viewErr := p.leasedb.View(func(tx *bolt.Tx) error {
+				b := tx.Bucket([]byte("leases4"))
+				if b == nil {
+					return fmt.Errorf("bucket not found")
+				}
+				v := b.Get([]byte(mac.String()))
+				if v == nil {
+					return fmt.Errorf("key %s not found", mac.String())
+				}
+				return json.Unmarshal(v, &stored)
+			}); viewErr != nil {
+				t.Fatalf("select lease failed: %v", viewErr)
 			}
-			if ip != tt.record.IP.String() {
-				t.Errorf("stored ip = %q, want %q", ip, tt.record.IP.String())
+			if stored.IP != tt.record.IP.String() {
+				t.Errorf("stored ip = %q, want %q", stored.IP, tt.record.IP.String())
 			}
-			if expiry != tt.record.expires {
-				t.Errorf("stored expiry = %d, want %d", expiry, tt.record.expires)
+			if stored.Expiry != tt.record.expires {
+				t.Errorf("stored expiry = %d, want %d", stored.Expiry, tt.record.expires)
 			}
-			if hostname != tt.record.hostname {
-				t.Errorf("stored hostname = %q, want %q", hostname, tt.record.hostname)
+			if stored.Hostname != tt.record.hostname {
+				t.Errorf("stored hostname = %q, want %q", stored.Hostname, tt.record.hostname)
 			}
 		})
 	}
 }
 
-//
-// Tests for (*PluginState).registerBackingDB
-//
-
 func TestRegisterBackingDB(t *testing.T) {
 	tests := []struct {
 		name       string
-		initialDB  *sql.DB
+		initialDB  *bolt.DB
 		wantErrSub string
 		check      func(t *testing.T, p *PluginState)
 	}{
@@ -418,10 +421,9 @@ func TestRegisterBackingDB(t *testing.T) {
 		},
 		{
 			name:       "errors_when_db_already_set",
-			initialDB:  &sql.DB{}, // any non-nil DB pointer
+			initialDB:  &bolt.DB{},
 			wantErrSub: "cannot swap out a lease database while running",
 			check: func(t *testing.T, p *PluginState) {
-				// should not have changed leasedb
 				if p.leasedb == nil {
 					t.Fatalf("leasedb was cleared unexpectedly")
 				}
@@ -451,11 +453,9 @@ func TestRegisterBackingDB(t *testing.T) {
 
 			tt.check(t, &p)
 
-			// A segfault occurs if we try to close. For test's sake, we don't.
-			//
-			//if p.leasedb != nil || !reflect.DeepEqual(p.leasedb, sql.DB{}) {
-			//	p.leasedb.Close()
-			//}
+			if tt.initialDB == nil && p.leasedb != nil {
+				p.leasedb.Close()
+			}
 		})
 	}
 }

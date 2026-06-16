@@ -6,7 +6,6 @@
 package bootloop
 
 import (
-	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -21,6 +20,7 @@ import (
 	"github.com/coredhcp/coredhcp/plugins/allocators"
 	"github.com/coredhcp/coredhcp/plugins/allocators/bitmap"
 	"github.com/insomniacslk/dhcp/dhcpv4"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/openchami/coresmd/internal/debug"
 	"github.com/openchami/coresmd/internal/ipxe"
@@ -42,7 +42,7 @@ type PluginState struct {
 	// Recordsv4 holds a MAC -> IP address and lease time mapping
 	Recordsv4      map[string]*Record
 	LeaseTime      time.Duration
-	leasedb        *sql.DB
+	leasedb        *bolt.DB
 	allocator      allocators.Allocator
 	subnetPoolMgr  *subnet.SubnetPoolManager
 	useSubnetPools bool
